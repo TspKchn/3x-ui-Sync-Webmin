@@ -33,7 +33,6 @@ db_exec() {
     fi
 }
 
-# เช็คและติดตั้งแพ็กเกจให้ครอบคลุมทั้ง SQLite และ Postgres
 for c in jq sshpass psql sqlite3 awk; do
     if ! command -v "$c" >/dev/null 2>&1; then
         echo "กำลังติดตั้งแพ็กเกจที่จำเป็น..."
@@ -138,7 +137,7 @@ do_fetch() {
     ' > "$TMP/users.txt" || { echo "❌ ดึงข้อมูล Webmin ไม่สำเร็จ"; return 1; }
 }
 
-### ================= SYNC CORE (1.5 SECONDS UNIVERSAL TURBO) =================
+### ================= SYNC CORE =================
 sync_core() {
     if [[ ! -f "$TMP/users.txt" ]]; then 
         echo "❌ ไม่พบไฟล์ users.txt ให้ดึงข้อมูลใหม่ (เมนู 1) ก่อน"
@@ -156,14 +155,12 @@ sync_core() {
 
     INBOUND_PROTO=$(db_exec "SELECT protocol FROM inbounds WHERE id=$INBOUND_ID;" || echo "vless")
 
-    # ดึง JSON จากฐานข้อมูลที่ตรวจพบ
     if [[ "$DB_TYPE" == "postgres" ]]; then
         psql "$PG_DSN" -A -t -c "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
     else
         sqlite3 -cmd ".timeout 10000" "$SQLITE_DB" "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
     fi
     
-    # 🛡️ ระบบรักษาตัวเอง (Self-Healing)
     RAW_SIZE=$(wc -c < "$TMP/settings.raw.json" || echo 0)
     if [ "$RAW_SIZE" -le 2 ]; then
         log "⚠️ ตรวจพบโครงสร้างว่างเปล่า ระบบกำลังซ่อมแซมโครงสร้าง JSON อัตโนมัติ..."
@@ -175,11 +172,9 @@ sync_core() {
     tr -d '\r' < "$TMP/users.txt" | awk '{print "{\""$1"\":"$2"}"}' | jq -s 'add // {}' > "$TMP/w_map.json"
     TS=$(date +%s%3N)
 
-    # แปลงและจัดการ VLESS decryption แบบอัตโนมัติ
     jq --slurpfile w "$TMP/w_map.json" --argjson ts "$TS" --arg proto "$INBOUND_PROTO" '
       ($w[0] // {}) as $webmin_dict |
       (.clients // [] | map({(.email): .}) | add // {}) as $old_clients_dict |
-
       .clients = [
         $webmin_dict | to_entries[] | .key as $email | .value as $exp |
         if ($old_clients_dict | has($email)) then
@@ -196,7 +191,6 @@ sync_core() {
       (if $proto == "vless" and (.fallbacks == null) then .fallbacks = [] else . end)
     ' "$TMP/settings.raw.json" > "$TMP/settings.min.json"
 
-    # อัปเดต JSON กลับเข้าฐานข้อมูล (แยกคำสั่งตามชนิด DB)
     if [[ "$DB_TYPE" == "postgres" ]]; then
         {
           echo -n "UPDATE inbounds SET settings = \$xui_payload\$"
@@ -210,12 +204,11 @@ sync_core() {
           sed "s/'/''/g" "$TMP/settings.min.json"
           echo "' WHERE id = $INBOUND_ID;"
         } > "$TMP/commit_settings.sql"
-        sqlite3 -cmd ".timeout 10000" "$SQLITE_DB" < "$TMP/commit_settings.sql"
+        sqlite3 -bail -cmd ".timeout 10000" "$SQLITE_DB" < "$TMP/commit_settings.sql"
     fi
     
     log "Reconciling 3x-ui v3.4.1 GUI tables..."
 
-    # กระจายข้อมูลลงตารางหน้าเว็บ (แยกไวยากรณ์ตามชนิด DB)
     if [[ "$DB_TYPE" == "postgres" ]]; then
         psql "$PG_DSN" -q <<SQL
 BEGIN;
@@ -232,13 +225,10 @@ SELECT c.id, $INBOUND_ID, '', (extract(epoch from now())*1000)::bigint FROM clie
 DELETE FROM client_inbounds WHERE inbound_id = $INBOUND_ID AND client_id NOT IN (
   SELECT c.id FROM clients c, inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j WHERE i.id = $INBOUND_ID AND c.email = j->>'email'
 );
-
 DELETE FROM clients WHERE id NOT IN (SELECT DISTINCT client_id FROM client_inbounds);
-
 DELETE FROM client_traffics WHERE inbound_id = $INBOUND_ID AND email NOT IN (
   SELECT j->>'email' FROM inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j WHERE i.id = $INBOUND_ID
 );
-
 DELETE FROM client_traffics WHERE expiry_time>0 AND expiry_time < (extract(epoch from now())*1000)::bigint;
 
 INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset)
@@ -248,33 +238,59 @@ ON CONFLICT DO NOTHING;
 COMMIT;
 SQL
     else
-        sqlite3 -cmd ".timeout 10000" "$SQLITE_DB" <<SQL
+        sqlite3 -bail -cmd ".timeout 10000" "$SQLITE_DB" <<SQL
 BEGIN TRANSACTION;
+
+DROP TABLE IF EXISTS temp_cli;
+CREATE TEMP TABLE temp_cli AS
+SELECT 
+  json_extract(value, '$.email') as email,
+  json_extract(value, '$.subId') as subId,
+  json_extract(value, '$.id') as uuid,
+  json_extract(value, '$.limitIp') as limitIp,
+  json_extract(value, '$.totalGB') as totalGB,
+  json_extract(value, '$.expiryTime') as expiryTime,
+  json_extract(value, '$.enable') as enable,
+  json_extract(value, '$.tgId') as tgId,
+  json_extract(value, '$.comment') as comment,
+  json_extract(value, '$.reset') as reset,
+  json_extract(value, '$.created_at') as created_at,
+  json_extract(value, '$.updated_at') as updated_at
+FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients');
+
+UPDATE clients
+SET expiry_time = (SELECT expiryTime FROM temp_cli WHERE temp_cli.email = clients.email),
+    enable = (SELECT enable FROM temp_cli WHERE temp_cli.email = clients.email),
+    updated_at = (SELECT updated_at FROM temp_cli WHERE temp_cli.email = clients.email)
+WHERE email IN (SELECT email FROM temp_cli);
+
 INSERT INTO clients (email, sub_id, uuid, password, limit_ip, total_gb, expiry_time, enable, tg_id, group_name, comment, reset, created_at, updated_at)
-SELECT json_extract(value, '$.email'), json_extract(value, '$.subId'), json_extract(value, '$.id'), json_extract(value, '$.id'), json_extract(value, '$.limitIp'), json_extract(value, '$.totalGB'), json_extract(value, '$.expiryTime'), json_extract(value, '$.enable'), json_extract(value, '$.tgId'), '', json_extract(value, '$.comment'), json_extract(value, '$.reset'), json_extract(value, '$.created_at'), json_extract(value, '$.updated_at')
-FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients')
-ON CONFLICT(email) DO UPDATE SET expiry_time = excluded.expiry_time, enable = excluded.enable, updated_at = excluded.updated_at;
+SELECT email, subId, uuid, uuid, limitIp, totalGB, expiryTime, enable, tgId, '', comment, reset, created_at, updated_at
+FROM temp_cli
+WHERE email NOT IN (SELECT email FROM clients);
 
 INSERT OR IGNORE INTO client_inbounds (client_id, inbound_id, flow_override, created_at)
-SELECT id, $INBOUND_ID, '', strftime('%s','now')*1000 FROM clients WHERE email IN (
-  SELECT json_extract(value, '$.email') FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients')
-);
+SELECT c.id, $INBOUND_ID, '', strftime('%s','now')*1000 
+FROM clients c JOIN temp_cli t ON c.email = t.email;
 
 DELETE FROM client_inbounds WHERE inbound_id = $INBOUND_ID AND client_id NOT IN (
-  SELECT c.id FROM clients c JOIN json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients') j ON c.email = json_extract(j.value, '$.email')
+  SELECT c.id FROM clients c JOIN temp_cli t ON c.email = t.email
 );
 
 DELETE FROM clients WHERE id NOT IN (SELECT DISTINCT client_id FROM client_inbounds);
 
 DELETE FROM client_traffics WHERE inbound_id = $INBOUND_ID AND email NOT IN (
-  SELECT json_extract(value, '$.email') FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients')
+  SELECT email FROM temp_cli
 );
 
 DELETE FROM client_traffics WHERE expiry_time>0 AND expiry_time < strftime('%s','now')*1000;
 
 INSERT OR IGNORE INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset)
-SELECT $INBOUND_ID, 1, json_extract(value, '$.email'), 0, 0, json_extract(value, '$.expiryTime'), 0, 0
-FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients');
+SELECT $INBOUND_ID, 1, email, 0, 0, expiryTime, 0, 0
+FROM temp_cli;
+
+DROP TABLE temp_cli;
+
 COMMIT;
 SQL
     fi
@@ -287,7 +303,9 @@ SQL
 
 ### ================= AUTO SYNC =================
 set_auto_sync() {
-    (crontab -l 2>/dev/null | grep -v user-sync.sh || true; echo "0 3 * * * $(realpath "$0") --auto") | crontab -
+    # 🚀 แก้ไขไม้เด็ด: ใช้ readlink ตรึง Path สคริปต์แบบ Absolute 100%
+    SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+    (crontab -l 2>/dev/null | grep -v user-sync.sh || true; echo "0 3 * * * $SCRIPT_PATH --auto") | crontab -
     echo "ตั้ง Auto Sync ทุกวันเวลา 03:00 น. เรียบร้อยแล้ว"; pause
 }
 
