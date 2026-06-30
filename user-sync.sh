@@ -126,7 +126,7 @@ do_fetch() {
     ' > "$TMP/users.txt" || { echo "❌ ดึงข้อมูล Webmin ไม่สำเร็จ"; return 1; }
 }
 
-### ================= SYNC CORE =================
+### ================= SYNC CORE (1.5 SECONDS TURBO) =================
 sync_core() {
     if [[ ! -f "$TMP/users.txt" ]]; then 
         echo "❌ ไม่พบไฟล์ users.txt ให้ดึงข้อมูลใหม่ (เมนู 1) ก่อน"
@@ -144,15 +144,17 @@ sync_core() {
 
     psql "$PG_DSN" -A -t -c "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
     
-    # 🛡️ ระบบรักษาตัวเอง: ตรวจสอบความถูกต้องของ JSON ถ้าไฟล์พังหรือดึงมาว่างเปล่า ให้สร้างโครงใหม่ทันที
-    if ! jq -e . >/dev/null 2>&1 < "$TMP/settings.raw.json"; then
-        log "⚠️ ตรวจพบโครงสร้าง JSON พังจากรอบก่อนหน้า ระบบกำลังซ่อมแซมอัตโนมัติ..."
+    # 🛡️ ถอดแบบมาจากเครื่องเอกซเรย์: ดักจับไฟล์แหว่ง 1-2 bytes เพื่อบังคับซ่อมแซมโครงสร้างเริ่มต้น
+    RAW_SIZE=$(wc -c < "$TMP/settings.raw.json" || echo 0)
+    if [ "$RAW_SIZE" -le 2 ]; then
+        log "⚠️ ตรวจพบโครงสร้างว่างเปล่า ระบบกำลังซ่อมแซมโครงสร้าง JSON อัตโนมัติ..."
         echo '{"clients": []}' > "$TMP/settings.raw.json"
     fi
 
     log "⚡ กำลังประมวลผลระบบ Dictionary Hash-Map ขนาด $TOTAL คน..."
     
-    tr -d '\r' < "$TMP/users.txt" | awk '{print "{\""$1"\":"$2"}"}' | jq -s 'add // {}' > "$TMP/w_map.json"
+    # ถอดแบบมาจากเครื่องเอกซเรย์: ใช้ jq ล้วนจัดการสมุดโทรศัพท์ ป้องกันอักษรพิเศษพังระบบ
+    jq -R -s 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1]|tonumber)}) | add // {}' "$TMP/users.txt" > "$TMP/w_map.json"
     TS=$(date +%s%3N)
 
     jq --slurpfile w "$TMP/w_map.json" --argjson ts "$TS" '
@@ -173,7 +175,7 @@ sync_core() {
       ]
     ' "$TMP/settings.raw.json" > "$TMP/settings.min.json"
 
-    # บันทึกข้อมูลด้วยโครงสร้างหลบหลีก 64KB ของ Postgres
+    # บันทึกข้อมูลแบบไร้ข้อจำกัด 64KB
     {
       echo -n "UPDATE inbounds SET settings = \$xui_payload\$"
       cat "$TMP/settings.min.json"
