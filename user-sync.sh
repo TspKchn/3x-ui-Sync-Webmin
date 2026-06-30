@@ -126,7 +126,7 @@ do_fetch() {
     ' > "$TMP/users.txt" || { echo "❌ ดึงข้อมูล Webmin ไม่สำเร็จ"; return 1; }
 }
 
-### ================= SYNC CORE (0.3 SECONDS HASH-MAP ENGINE) =================
+### ================= SYNC CORE =================
 sync_core() {
     if [[ ! -f "$TMP/users.txt" ]]; then 
         echo "❌ ไม่พบไฟล์ users.txt ให้ดึงข้อมูลใหม่ (เมนู 1) ก่อน"
@@ -143,14 +143,18 @@ sync_core() {
     if [[ "$TOTAL" -eq 0 ]]; then return 1; fi
 
     psql "$PG_DSN" -A -t -c "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
+    
+    # 🛡️ ระบบรักษาตัวเอง: ตรวจสอบความถูกต้องของ JSON ถ้าไฟล์พังหรือดึงมาว่างเปล่า ให้สร้างโครงใหม่ทันที
+    if ! jq -e . >/dev/null 2>&1 < "$TMP/settings.raw.json"; then
+        log "⚠️ ตรวจพบโครงสร้าง JSON พังจากรอบก่อนหน้า ระบบกำลังซ่อมแซมอัตโนมัติ..."
+        echo '{"clients": []}' > "$TMP/settings.raw.json"
+    fi
 
     log "⚡ กำลังประมวลผลระบบ Dictionary Hash-Map ขนาด $TOTAL คน..."
     
-    # ท่อที่ 1: เปลี่ยน users.txt เป็นตารางดิกชันนารีในความจำ RAM
     tr -d '\r' < "$TMP/users.txt" | awk '{print "{\""$1"\":"$2"}"}' | jq -s 'add // {}' > "$TMP/w_map.json"
     TS=$(date +%s%3N)
 
-    # ท่อที่ 2: สั่ง jq ตบแปะข้อมูลม้วนเดียวจบ (ไม่ใช้ $ นำหน้าคีย์ ลดความเสี่ยงพัง 100%)
     jq --slurpfile w "$TMP/w_map.json" --argjson ts "$TS" '
       ($w[0] // {}) as $webmin_dict |
       (.clients // [] | map({(.email): .}) | add // {}) as $old_clients_dict |
@@ -169,11 +173,14 @@ sync_core() {
       ]
     ' "$TMP/settings.raw.json" > "$TMP/settings.min.json"
 
-    # ท่อที่ 3: บันทึกลง PostgreSQL ผ่านคำสั่ง \set
-    psql "$PG_DSN" -q <<SQL
-\set new_settings \`cat $TMP/settings.min.json\`
-UPDATE inbounds SET settings = :'new_settings' WHERE id = $INBOUND_ID;
-SQL
+    # บันทึกข้อมูลด้วยโครงสร้างหลบหลีก 64KB ของ Postgres
+    {
+      echo -n "UPDATE inbounds SET settings = \$xui_payload\$"
+      cat "$TMP/settings.min.json"
+      echo "\$xui_payload\$ WHERE id = $INBOUND_ID;"
+    } > "$TMP/commit_settings.sql"
+
+    psql "$PG_DSN" -q -f "$TMP/commit_settings.sql"
     
     log "Reconciling 3x-ui v3.4.1 GUI tables in PostgreSQL..."
 
