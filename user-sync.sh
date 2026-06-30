@@ -142,9 +142,11 @@ sync_core() {
     echo "[*] Total users to sync: $TOTAL (ลง Inbound ID: $INBOUND_ID)"
     if [[ "$TOTAL" -eq 0 ]]; then return 1; fi
 
+    # 🚀 ตรวจสอบโปรโตคอลว่าเป็น VLESS หรือไม่ เพื่อจัดการ decryption
+    INBOUND_PROTO=$(psql "$PG_DSN" -A -t -c "SELECT protocol FROM inbounds WHERE id=$INBOUND_ID;" || echo "vless")
+
     psql "$PG_DSN" -A -t -c "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
     
-    # 🛡️ ถอดแบบมาจากเครื่องเอกซเรย์: ดักจับไฟล์แหว่ง 1-2 bytes เพื่อบังคับซ่อมแซมโครงสร้างเริ่มต้น
     RAW_SIZE=$(wc -c < "$TMP/settings.raw.json" || echo 0)
     if [ "$RAW_SIZE" -le 2 ]; then
         log "⚠️ ตรวจพบโครงสร้างว่างเปล่า ระบบกำลังซ่อมแซมโครงสร้าง JSON อัตโนมัติ..."
@@ -153,11 +155,11 @@ sync_core() {
 
     log "⚡ กำลังประมวลผลระบบ Dictionary Hash-Map ขนาด $TOTAL คน..."
     
-    # ถอดแบบมาจากเครื่องเอกซเรย์: ใช้ jq ล้วนจัดการสมุดโทรศัพท์ ป้องกันอักษรพิเศษพังระบบ
-    jq -R -s 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1]|tonumber)}) | add // {}' "$TMP/users.txt" > "$TMP/w_map.json"
+    tr -d '\r' < "$TMP/users.txt" | awk '{print "{\""$1"\":"$2"}"}' | jq -s 'add // {}' > "$TMP/w_map.json"
     TS=$(date +%s%3N)
 
-    jq --slurpfile w "$TMP/w_map.json" --argjson ts "$TS" '
+    # 🚀 แก้ไข: เพิ่มกฎบังคับฝัง decryption: none หากพบว่าเป็น VLESS
+    jq --slurpfile w "$TMP/w_map.json" --argjson ts "$TS" --arg proto "$INBOUND_PROTO" '
       ($w[0] // {}) as $webmin_dict |
       (.clients // [] | map({(.email): .}) | add // {}) as $old_clients_dict |
 
@@ -172,10 +174,11 @@ sync_core() {
             "created_at": $ts, "updated_at": $ts
           }
         end
-      ]
+      ] |
+      (if $proto == "vless" then .decryption = "none" else . end) |
+      (if $proto == "vless" and (.fallbacks == null) then .fallbacks = [] else . end)
     ' "$TMP/settings.raw.json" > "$TMP/settings.min.json"
 
-    # บันทึกข้อมูลแบบไร้ข้อจำกัด 64KB
     {
       echo -n "UPDATE inbounds SET settings = \$xui_payload\$"
       cat "$TMP/settings.min.json"
