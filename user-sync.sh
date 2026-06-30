@@ -1,11 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
-### ================= CONFIG =================
-PG_DSN=$(grep '^XUI_DB_DSN=' /etc/default/x-ui | cut -d= -f2- | tr -d '"' | tr -d "'")
+### ================= CONFIG & AUTO-DETECT DB =================
 CONF="/etc/user-sync.conf"
 TMP="/tmp/user-sync"
 mkdir -p "$TMP"
+
+DB_TYPE="sqlite"
+if grep -q '^XUI_DB_TYPE=postgres' /etc/default/x-ui 2>/dev/null; then
+    DB_TYPE="postgres"
+    PG_DSN=$(grep '^XUI_DB_DSN=' /etc/default/x-ui | cut -d= -f2- | tr -d '"' | tr -d "'")
+else
+    SQLITE_DB="/etc/x-ui/x-ui.db"
+fi
 
 ### ================= UTILS =================
 pause() { read -rp "กด Enter เพื่อกลับเมนู..."; }
@@ -19,13 +26,18 @@ require_root() {
 require_root
 
 db_exec() {
-    psql "$PG_DSN" -A -t -F '|' -c "$1"
+    if [[ "$DB_TYPE" == "postgres" ]]; then
+        psql "$PG_DSN" -A -t -F '|' -c "$1"
+    else
+        sqlite3 -cmd ".timeout 10000" "$SQLITE_DB" "$1"
+    fi
 }
 
-for c in jq sshpass psql awk; do
+# เช็คและติดตั้งแพ็กเกจให้ครอบคลุมทั้ง SQLite และ Postgres
+for c in jq sshpass psql sqlite3 awk; do
     if ! command -v "$c" >/dev/null 2>&1; then
-        echo "กำลังติดตั้ง $c ..."
-        apt update -y && apt install -y jq sshpass postgresql-client gawk
+        echo "กำลังติดตั้งแพ็กเกจที่จำเป็น..."
+        apt update -y && apt install -y jq sshpass postgresql-client sqlite3 gawk
         break
     fi
 done
@@ -63,7 +75,7 @@ EOF
 
 ### ================= SELECT INBOUND =================
 select_inbound() {
-    echo "[*] โหลดรายการ inbound จาก PostgreSQL..."
+    echo "[*] โหลดรายการ inbound จากฐานข้อมูล (${DB_TYPE^^})..."
     mapfile -t INBOUND_LIST < <(db_exec "SELECT id, remark, protocol, port FROM inbounds;")
     
     if [[ ${#INBOUND_LIST[@]} -eq 0 ]]; then
@@ -126,7 +138,7 @@ do_fetch() {
     ' > "$TMP/users.txt" || { echo "❌ ดึงข้อมูล Webmin ไม่สำเร็จ"; return 1; }
 }
 
-### ================= SYNC CORE (1.5 SECONDS TURBO) =================
+### ================= SYNC CORE (1.5 SECONDS UNIVERSAL TURBO) =================
 sync_core() {
     if [[ ! -f "$TMP/users.txt" ]]; then 
         echo "❌ ไม่พบไฟล์ users.txt ให้ดึงข้อมูลใหม่ (เมนู 1) ก่อน"
@@ -142,23 +154,28 @@ sync_core() {
     echo "[*] Total users to sync: $TOTAL (ลง Inbound ID: $INBOUND_ID)"
     if [[ "$TOTAL" -eq 0 ]]; then return 1; fi
 
-    # 🚀 ตรวจสอบโปรโตคอลว่าเป็น VLESS หรือไม่ เพื่อจัดการ decryption
-    INBOUND_PROTO=$(psql "$PG_DSN" -A -t -c "SELECT protocol FROM inbounds WHERE id=$INBOUND_ID;" || echo "vless")
+    INBOUND_PROTO=$(db_exec "SELECT protocol FROM inbounds WHERE id=$INBOUND_ID;" || echo "vless")
 
-    psql "$PG_DSN" -A -t -c "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
+    # ดึง JSON จากฐานข้อมูลที่ตรวจพบ
+    if [[ "$DB_TYPE" == "postgres" ]]; then
+        psql "$PG_DSN" -A -t -c "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
+    else
+        sqlite3 -cmd ".timeout 10000" "$SQLITE_DB" "SELECT settings FROM inbounds WHERE id=$INBOUND_ID;" > "$TMP/settings.raw.json"
+    fi
     
+    # 🛡️ ระบบรักษาตัวเอง (Self-Healing)
     RAW_SIZE=$(wc -c < "$TMP/settings.raw.json" || echo 0)
     if [ "$RAW_SIZE" -le 2 ]; then
         log "⚠️ ตรวจพบโครงสร้างว่างเปล่า ระบบกำลังซ่อมแซมโครงสร้าง JSON อัตโนมัติ..."
         echo '{"clients": []}' > "$TMP/settings.raw.json"
     fi
 
-    log "⚡ กำลังประมวลผลระบบ Dictionary Hash-Map ขนาด $TOTAL คน..."
+    log "⚡ กำลังประมวลผลระบบ Hash-Map ขนาด $TOTAL คน บนฐานข้อมูล ${DB_TYPE^^}..."
     
     tr -d '\r' < "$TMP/users.txt" | awk '{print "{\""$1"\":"$2"}"}' | jq -s 'add // {}' > "$TMP/w_map.json"
     TS=$(date +%s%3N)
 
-    # 🚀 แก้ไข: เพิ่มกฎบังคับฝัง decryption: none หากพบว่าเป็น VLESS
+    # แปลงและจัดการ VLESS decryption แบบอัตโนมัติ
     jq --slurpfile w "$TMP/w_map.json" --argjson ts "$TS" --arg proto "$INBOUND_PROTO" '
       ($w[0] // {}) as $webmin_dict |
       (.clients // [] | map({(.email): .}) | add // {}) as $old_clients_dict |
@@ -179,41 +196,41 @@ sync_core() {
       (if $proto == "vless" and (.fallbacks == null) then .fallbacks = [] else . end)
     ' "$TMP/settings.raw.json" > "$TMP/settings.min.json"
 
-    {
-      echo -n "UPDATE inbounds SET settings = \$xui_payload\$"
-      cat "$TMP/settings.min.json"
-      echo "\$xui_payload\$ WHERE id = $INBOUND_ID;"
-    } > "$TMP/commit_settings.sql"
-
-    psql "$PG_DSN" -q -f "$TMP/commit_settings.sql"
+    # อัปเดต JSON กลับเข้าฐานข้อมูล (แยกคำสั่งตามชนิด DB)
+    if [[ "$DB_TYPE" == "postgres" ]]; then
+        {
+          echo -n "UPDATE inbounds SET settings = \$xui_payload\$"
+          cat "$TMP/settings.min.json"
+          echo "\$xui_payload\$ WHERE id = $INBOUND_ID;"
+        } > "$TMP/commit_settings.sql"
+        psql "$PG_DSN" -q -f "$TMP/commit_settings.sql"
+    else
+        {
+          echo -n "UPDATE inbounds SET settings = '"
+          sed "s/'/''/g" "$TMP/settings.min.json"
+          echo "' WHERE id = $INBOUND_ID;"
+        } > "$TMP/commit_settings.sql"
+        sqlite3 -cmd ".timeout 10000" "$SQLITE_DB" < "$TMP/commit_settings.sql"
+    fi
     
-    log "Reconciling 3x-ui v3.4.1 GUI tables in PostgreSQL..."
+    log "Reconciling 3x-ui v3.4.1 GUI tables..."
 
-    psql "$PG_DSN" -q <<SQL
+    # กระจายข้อมูลลงตารางหน้าเว็บ (แยกไวยากรณ์ตามชนิด DB)
+    if [[ "$DB_TYPE" == "postgres" ]]; then
+        psql "$PG_DSN" -q <<SQL
 BEGIN;
-
-INSERT INTO clients (
-  email, sub_id, uuid, password, limit_ip, total_gb, expiry_time, enable, tg_id, group_name, comment, reset, created_at, updated_at
-)
-SELECT 
-  j->>'email', j->>'subId', j->>'id', j->>'id', (j->>'limitIp')::int, (j->>'totalGB')::bigint,
-  (j->>'expiryTime')::bigint, (j->>'enable')::boolean, (j->>'tgId')::int, '', j->>'comment',
-  (j->>'reset')::int, (j->>'created_at')::bigint, (j->>'updated_at')::bigint
-FROM inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j
-WHERE i.id = $INBOUND_ID
-ON CONFLICT (email) DO UPDATE SET
-  expiry_time = EXCLUDED.expiry_time, enable = EXCLUDED.enable, updated_at = EXCLUDED.updated_at;
+INSERT INTO clients (email, sub_id, uuid, password, limit_ip, total_gb, expiry_time, enable, tg_id, group_name, comment, reset, created_at, updated_at)
+SELECT j->>'email', j->>'subId', j->>'id', j->>'id', (j->>'limitIp')::int, (j->>'totalGB')::bigint, (j->>'expiryTime')::bigint, (j->>'enable')::boolean, (j->>'tgId')::int, '', j->>'comment', (j->>'reset')::int, (j->>'created_at')::bigint, (j->>'updated_at')::bigint
+FROM inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j WHERE i.id = $INBOUND_ID
+ON CONFLICT (email) DO UPDATE SET expiry_time = EXCLUDED.expiry_time, enable = EXCLUDED.enable, updated_at = EXCLUDED.updated_at;
 
 INSERT INTO client_inbounds (client_id, inbound_id, flow_override, created_at)
-SELECT c.id, $INBOUND_ID, '', (extract(epoch from now())*1000)::bigint
-FROM clients c
-WHERE c.email IN (
+SELECT c.id, $INBOUND_ID, '', (extract(epoch from now())*1000)::bigint FROM clients c WHERE c.email IN (
   SELECT j->>'email' FROM inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j WHERE i.id = $INBOUND_ID
 ) ON CONFLICT DO NOTHING;
 
 DELETE FROM client_inbounds WHERE inbound_id = $INBOUND_ID AND client_id NOT IN (
-  SELECT c.id FROM clients c, inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j
-  WHERE i.id = $INBOUND_ID AND c.email = j->>'email'
+  SELECT c.id FROM clients c, inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j WHERE i.id = $INBOUND_ID AND c.email = j->>'email'
 );
 
 DELETE FROM clients WHERE id NOT IN (SELECT DISTINCT client_id FROM client_inbounds);
@@ -228,9 +245,39 @@ INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, t
 SELECT $INBOUND_ID, true, j->>'email', 0, 0, (j->>'expiryTime')::bigint, 0, 0
 FROM inbounds i, jsonb_array_elements(i.settings::jsonb->'clients') j WHERE i.id = $INBOUND_ID
 ON CONFLICT DO NOTHING;
-
 COMMIT;
 SQL
+    else
+        sqlite3 -cmd ".timeout 10000" "$SQLITE_DB" <<SQL
+BEGIN TRANSACTION;
+INSERT INTO clients (email, sub_id, uuid, password, limit_ip, total_gb, expiry_time, enable, tg_id, group_name, comment, reset, created_at, updated_at)
+SELECT json_extract(value, '$.email'), json_extract(value, '$.subId'), json_extract(value, '$.id'), json_extract(value, '$.id'), json_extract(value, '$.limitIp'), json_extract(value, '$.totalGB'), json_extract(value, '$.expiryTime'), json_extract(value, '$.enable'), json_extract(value, '$.tgId'), '', json_extract(value, '$.comment'), json_extract(value, '$.reset'), json_extract(value, '$.created_at'), json_extract(value, '$.updated_at')
+FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients')
+ON CONFLICT(email) DO UPDATE SET expiry_time = excluded.expiry_time, enable = excluded.enable, updated_at = excluded.updated_at;
+
+INSERT OR IGNORE INTO client_inbounds (client_id, inbound_id, flow_override, created_at)
+SELECT id, $INBOUND_ID, '', strftime('%s','now')*1000 FROM clients WHERE email IN (
+  SELECT json_extract(value, '$.email') FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients')
+);
+
+DELETE FROM client_inbounds WHERE inbound_id = $INBOUND_ID AND client_id NOT IN (
+  SELECT c.id FROM clients c JOIN json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients') j ON c.email = json_extract(j.value, '$.email')
+);
+
+DELETE FROM clients WHERE id NOT IN (SELECT DISTINCT client_id FROM client_inbounds);
+
+DELETE FROM client_traffics WHERE inbound_id = $INBOUND_ID AND email NOT IN (
+  SELECT json_extract(value, '$.email') FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients')
+);
+
+DELETE FROM client_traffics WHERE expiry_time>0 AND expiry_time < strftime('%s','now')*1000;
+
+INSERT OR IGNORE INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset)
+SELECT $INBOUND_ID, 1, json_extract(value, '$.email'), 0, 0, json_extract(value, '$.expiryTime'), 0, 0
+FROM json_each((SELECT settings FROM inbounds WHERE id=$INBOUND_ID), '$.clients');
+COMMIT;
+SQL
+    fi
 
     systemctl restart x-ui || x-ui restart
     save_last_sync
@@ -260,8 +307,9 @@ fi
 while true; do
     load_config; load_last_sync; clear
     echo "========================================="
-    echo "  USER SYNC (PostgreSQL Turbo Edition)"
+    echo "  USER SYNC (Universal Turbo Edition)"
     echo "========================================="
+    echo "Database: ${DB_TYPE^^} (Auto-Detected)"
     echo "Last Sync: $LAST_SYNC"
     echo "-----------------------------------------"
     echo "1) ดึงข้อมูลใหม่จาก Webmin และ Sync ทันที"
